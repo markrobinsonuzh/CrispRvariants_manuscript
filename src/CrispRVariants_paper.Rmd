@@ -1,0 +1,1791 @@
+---
+title: "Code accompanying *CrispRVariants: precisely charting the mutation spectrum in genome engineering experiments*"
+author: "Helen Lindsay"
+date: "11th February 2016"
+output:
+  BiocStyle::pdf_document:
+    fig_caption: true
+    toc: true
+---
+
+\tableofcontents
+\newpage
+
+
+<!-- build with:
+rmarkdown::render("CrispRVariants_paper.Rmd", rmarkdown::pdf_document())
+-->
+
+# Notes about code
+
+In this guide, I use double colon notation to indicate which package a function belongs
+to, e.g. ```rtracklayer::import```, when I think it may be of interest.  This notation
+is not necessary for running the code.  Note that some packages import other packages,
+so the parent package may not be one of the imported packages.
+
+The analyses for the Supplementary Notes are not completely independent of each other.
+The sections of this guide are therefore ordered in a logical way for running the code,
+not as they appear in the Supplementary material.
+
+Most of the code is R code.  Occasional segments are Bash code.  These are indicated
+by a comment "(BASH)" at the start of the section.
+
+# Software requirements
+
+This code requires the command line programs *bwa*, *samtools*, *pear*, *seqprep*
+*blat* and *CRISPResso* to be installed.  Paths may need to be altered to reflect
+installation location.  Scripts ```samGetSEQfast.pl``` from *rackJ* and *psl2sam.pl*
+from *samtools* also required for converting *blat* to *bam* output.  We assume 
+these are stored in the *src* directory.
+
+The python scripts for primer splitting require the python libraries
+*argparse*, *regex*, *gzip*, *os* and *sys*.
+
+
+%%%%%
+ r libraries
+%%%%
+
+# Directory structure
+
+The working directory for this analysis has the following structure:
+
+```
+|-- annotation
+|-- bam
+|-- Burger_MiSeq_data
+|-- Burger_Sanger_data
+|-- Cho_data
+|-- fastq
+|-- idx
+|-- merged_split
+|-- README
+|-- split_merged
+|-- src
+```
+
+Scripts are in *src* and bwa genome and faidx indices for danRer7 
+are in *idx*. External information such as guide locations and sample 
+names is in *annotation*.  *fastq* contains the original and renamed fastq
+files for the Shah *et al* data.  *merged_split* and *split_merged* contain
+corresponding reads that have been merged and separated by forward 
+primer sequence and *bam* contains corresponding aligned reads.
+
+Data from Burger *et al* and Cho *et al* is stored in the
+*Burger_MiSeq_data*, *Burger_Sanger_data* and *Cho_data* folders.
+
+This code depends on this directory structure and will fail if the
+data have not been downloaded and unpacked from the correct repositories.
+All code is run from the *src* directory.
+
+# Analysis of *wtx* in main text
+
+For this analysis we use a pre-generated transcript database (txdb) corresponding
+to the danRer7 genes.  This was generated from the Ensembl gtf file. For information
+about generating a transcript database see the GenomicFeatures Bioconductor package.
+
+```{r, message=FALSE, cache = TRUE}
+library("CrispRVariants")
+library("gdata")
+library("BSgenome.Drerio.UCSC.danRer7")
+library("GenomicFeatures")
+library("rtracklayer")
+
+# Load the genome and the transcript database
+danRer7 <- BSgenome.Drerio.UCSC.danRer7
+txdb <- loadDb("~/zebrafish_txdb.sqlite")
+
+# Import the guide sequence location
+gd <- rtracklayer::import("../annotation/Burger_Sanger_guides.bed")
+gd <- gd[gd$name == "wtx_ccA"]
+# Add extra bases to both sides of the guide for counting variants
+gdl <- gd+5
+
+md_fname <- "../annotation/Burger_wtx_metadata.xls"
+md <- read.xls(md_fname)
+guide_n <- "wtx_ccA"
+bdir <- "../Burger_Sanger_data/wtx_ccA/bam"
+bams <- paste0(gsub("[\ |\\/]", "_", md$directory), "_s.bam")
+bam_fnames <- file.path(bdir, bams)
+ref <- getSeq(danRer7, gdl)
+if (as.character(strand(gdl)) == "-"){
+    ref <- reverseComplement(ref)
+}
+# After manual inspection, we considered the alignment of "AB1060"
+# to be poor and so remove this sequence.
+cset <- readsToTarget(bam_fnames, gdl, reference = ref, target.loc = 22,
+                      names = as.character(md$Short.name),
+                      exclude.names = "AB1060")
+group <- md[md$Short.name %in% names(cset$crispr_runs),"Group"]
+
+plotVariants(cset,txdb=txdb, plotAlignments.args = list(legend.cols = 4),  plotFreqHeatmap.args = list(group = group),
+  left.plot.margin = grid::unit(c(0.5,0.5,1,0.5), "lines"))
+```
+
+
+# Supplementary Analyses
+
+## Preprocessing Shah data
+
+The raw data from Shah *et al* was downloaded from
+[DDBJ](https://trace.ddbj.nig.ac.jp/DRASearch/study?acc=SRP052749) and extracted using ```fastq-dump --split-files```.
+
+We map with **BWA-MEM** (http://bio-bwa.sourceforge.net/) to genome version danRer7.  We previously generated indices for this genome using *bwa index* and stored them in the *idx* directory.
+
+### Determine guide location by mapping to the danRer7 genome
+
+The guides and primer sequences were extracted from the Supplementary
+metadata table and mapped to danRer7.  When a sequence mapped equally
+well to multiple locations, the correct location was chosen by manual
+inspection.  We confirmed the correct primer sequences with Shah *et al*.
+In the original supplementary table file, two primers were swapped.
+These are corrected in the version used here.
+
+```{r, eval = FALSE}
+library(seqinr)
+library(gdata)
+
+# Write the guides to FASTA
+shah_results <- read.xls("../annotation/Shah_metadata.xls")
+guide_nms <- gsub("\ ", "", shah_results$Gene)
+guide_seqs <- gsub("\ ", "", shah_results$sgRNA)
+write.fasta(as.list(guide_seqs), guide_nms, file = "guides.fa")
+
+# Map the guides with BWA allowing at most 2 mismatches and disallowing gaps
+bwa_idx <- "danRer7.fa"
+bwa_cmd <- paste0(c("bwa aln -n 2 -o 0 %s %s | bwa samse %s - %s | ",
+                    "samtools view -Sb - > %s; samtools sort %s %s && rm %s"),
+                  collapse = "")
+system(sprintf(bwa_cmd, bwa_idx, "guides.fa", bwa_idx, "guides.fa", 
+       "guides.bam", "guides.bam", "guides_s", "guides.bam"))
+
+system(sprintf(bwa_cmd, bwa_idx, "primers.fa", bwa_idx, "primers.fa", 
+        "primers.bam", "primers.bam", "primers_s", "primers.bam"))
+```
+
+The bed files listing the primer and guide locations were manually
+curated from the sequences generated here.
+
+### Mapping paired reads with BWA MEM
+
+This section is run in BASH.
+
+```{r, engine='bash', eval=FALSE}
+#(BASH)
+# "index" is the prefix of our set of bwa indices for danRer7
+# We used bwa version 0.7.5a-r405
+index=../idx/danRer7.fa
+fq1=../fastq/SRR1769728_1.fastq.gz
+fq2=../fastq/SRR1769728_2.fastq.gz
+bwa mem -t 4 $index $fq1 $fq2 | samtools view -Sb - > ../bam/SRR1769728.bam
+samtools sort ../bam/SRR1769728.bam ../bam/original && rm ../bam/SRR1769728.bam
+samtools index ../bam/original.bam
+```
+
+### Merging reads with PEAR and SEQ PREP
+
+The read names are in the format "@readName length=251".  The read lengths
+were first stripped from the read names, as these are not always
+identical between the pairs and cause SeqPrep to crash.
+
+This section is run in BASH.
+
+```{r, engine='bash', eval=FALSE}
+#(BASH)
+
+fq1r=../fastq/SRR1769728_1_renamed.fastq
+fq2r=../fastq/SRR1769728_2_renamed.fastq
+zcat $fq1 | awk '{if (NR % 2 == 1) print $1, $2; else print $1}' > $fq1r; gzip $fq1r
+zcat  $fq2 | awk '{if (NR % 2 == 1) print $1, $2; else print $1}' > $fq2r; gzip $fq2r
+
+```
+
+Then paired end reads were merged with [SeqPrep](https://github.com/jstjohn/SeqPrep).
+The parameter "-n 1" specifies that reads must have identical length 
+(100% overlap), "-L 55" specifies that the merged reads must be at least 55 bases 
+long.  The longest combined forward and reverse primer length is 52 bases.
+Reads at least 55 bases long should therefore not consist of primer dimers.
+
+Reads were also merged with PEAR, with default settings.  
+Running this section requires SeqPrep and PEAR to be installed.
+
+```{r, engine='bash', eval=FALSE}
+#(BASH)
+
+# 1. Merge with SeqPrep as in paper
+out1=../fastq/SRR1769728_1_sp.fastq.gz
+out2=../fastq/SRR1769728_2_sp.fastq.gz
+merged_sp_fq=../fastq/SRR1769728_merged_seqprep.fastq.gz
+~/SeqPrep -f $fq1r -r $fq2r -1 $out1 -2 $out2 -g -n 1.0 -s ${merged_sp_fq}
+
+# 2. Merge with SeqPrep filtering only on length (default -n is 0.9)
+out3=../fastq/SRR1769728_1_sp_l55.fastq.gz
+out4=../fastq/SRR1769728_2_sp_l55.fastq.gz
+merged_sp_l55_fq=../fastq/SRR1769728_merged_seqprep_l55.fastq.gz
+~/SeqPrep -f $fq1r -r $fq2r -1 $out3 -2 $out4 -L 55 -s ${merged_sp_l55_fq}
+
+# Cleanup files that are no longer needed
+rm $fq1r $fq2r $out1 $out2 $out3 $out4
+
+# Also merge with PEAR
+# Start with unzipped fastq (BZIP2 also works)
+gunzip ${fq1} ${fq2}
+fq1=../fastq/SRR1769728_1.fastq
+fq2=../fastq/SRR1769728_2.fastq
+
+merged_pear_fq=../fastq/SRR1769728_merged_pear
+pear-0.9.4-64 -j 12 -f $fq1 -r $fq2 -o ${merged_pear_fq}
+o1=SRR1769728_merged_pear.unassembled.forward.fastq
+o2=SRR1769728_merged_pear.unassembled.reverse.fastq
+o3=SRR1769728_merged_pear.discarded.fastq
+rm ${o1} ${o2} ${o3}
+gzip ${fq1} ${fq2} ${merged_pear_fq}.assembled.fastq
+merged_pear_fq=../fastq/SRR1769728_merged_pear.assembled.fastq.gz
+```
+
+Mapping of the remaining fastq reads was performed with identical
+parameters.  Details are in ```run_mapping.R```
+
+## Splitting reads by PCR primer
+
+In Shah *et al*, paired end reads were merged using **Seq-Prep** then split into amplicon sequences using **NGS-Utils**.  We compared two preprocessing strategies using the data from Shah *et al*: *split-then-merge* where reads were first grouped by PCR primer then merged; and *merge-then-split* where reads first merged then split by primer.  As **fastqutils barcode_split** in **NGS-Utils** accepts a single, i.e. merged, fastq file, we wrote a python script *split_by_primers.py* to allow splitting paired-end reads by primer sequence either before or after merging.  As in Shah *et al*, to assign reads to an amplicon, we required a match with at most one error to the forward primer only and allowed matches to either the forward primer or its reverse complement
+
+### *merge-then-split*: Separate merged reads by PCR primer
+
+```{r, engine='bash', eval=FALSE}
+#(in BASH)
+
+fwd_primers=../annotation/shah_fwd_primers.txt
+
+for merged in $merged_sp_fq $merged_sp_l55_fq $merged_pear_fq
+do
+  python split_by_primers.py -r1 ${merged} -o ../merged_split -p ${fwd_primers}
+done
+```
+
+### *merge-then-split*  Comparison of tolerance settings for matching primers
+
+Comparison of read splitting settings was done for the reads merged with PEAR.
+
+```{r, engine='bash', eval=FALSE}
+#(In BASH)
+python split_by_primers.py -c
+```
+
+## *split-then-merge:* 
+
+Separate unmerged reads by PCR primer then merge.
+
+```{r, engine='bash', eval=FALSE}
+#(in BASH)
+
+out=../split_merged
+fq1=../fastq/SRR1769728_1.fastq.gz
+fq2=../fastq/SRR1769728_2.fastq.gz
+
+python split_by_primers.py -r1 ${fq1} -r2 ${fq2} -o ${out} -p ${fwd_primers}
+
+```
+
+Merge the separated reads with PEAR. 
+
+```{r, engine='bash', eval=FALSE}
+#(in BASH)
+
+fq1=SRR1769728_1.fastq.gz
+fq2=SRR1769728_2.fastq.gz
+
+cd ../split_merged
+
+for f in *
+do
+  cd ${f}
+  gunzip ${fq1} ${fq2}
+  pear-0.9.4-64 -j 12 -f ${fq1%.*} -r ${fq2%.*} -o SRR1769728_merged_pear
+  rm ${fq1%.*} ${fq2%.*}
+  rm *unassembled* *discarded*
+  mv SRR1769728_merged_pear.assembled.fastq SRR1769728_merged_pear.fastq
+  gzip SRR1769728_merged_pear.fastq
+  cd ..
+done
+cd ../src
+```
+
+## Mapping to genome with BWA MEM
+
+Mapping with blat to the danRer7 was done by running the script 
+```runn_blat_global.sh```
+
+## Mapping to amplicon references with BLAT
+
+Generation of the amplicon references and local alignment with blat is detailed
+in the script ```run_blat_local.sh```.  Conversion to *bam* format is not
+possible with early verions of *blat*.  We use *blat* version 35.
+
+# Data setup
+
+```{r, message = FALSE}
+
+library("CrispRVariants")
+library("BiocParallel")
+library("Biostrings")
+library("BSgenome.Drerio.UCSC.danRer7")
+library("gdata")
+library("GenomicFeatures")
+library("ggplot2")
+library("grid")
+library("gridExtra")
+library("reshape2")
+library("rtracklayer")
+library("scales")
+
+# Load the danRer7 / Zv9 genome
+danRer7 <- BSgenome.Drerio.UCSC.danRer7
+
+# Import the guide locations (inc PAM), add 5 to either end
+guides <- rtracklayer::import("../annotation/shah_guides.bed")
+names(guides) <- guides$name
+guides <- guides + 5
+
+# Get guide sequences from the genome
+# (note: guide sequences could also be input directly)
+references <- getSeq(danRer7, guides)
+
+# Import the primer (amplicon) endpoints
+primers <- rtracklayer::import("../annotation/shah_primers.bed")
+names(primers) <- primers$name
+
+# Directories
+# each directory corresponds to a different preprocessing condition
+bam_dir <- "../bam"
+unmerged <- file.path(bam_dir, "original.bam")
+merged <- file.path(bam_dir, "merged_seqprep.bam")
+merged_seqprep <- file.path(bam_dir, "merged_split_seqprep")
+merged_split_l55 <- file.path(bam_dir, "merged_split_l55_n90")
+merged_split_pear <- file.path(bam_dir, "merged_split_pear")
+split_merged_pear <- file.path(bam_dir, "split_merged_pear")
+tolerant_pear <- file.path(bam_dir, "merged_split_pear_tolerant")
+strict_pear <- file.path(bam_dir, "merged_split_pear_strict")
+blat_local <- file.path(bam_dir, "blat_local")
+blat_global <- file.path(bam_dir, "blat_global")
+
+```
+
+
+# Functions
+
+The following functions are used in multiple sections throughout this document.
+
+###getCrisprSets
+For comparing methods, we have a set of directories each containing
+one bam file per guide.  This function processes all files in a
+given directory.
+```{r}
+getCrisprSets <- function(directory, references, guides,
+                          bpparam = BiocParallel::MulticoreParam(8)){
+
+  bams <- list.files(directory, pattern = "*.bam$", full.names = TRUE)
+  
+  # Get the guide names from the bam file names
+  gd_nms <- gsub(".*/(.*).bam", "\\1", bams)
+  
+  # Match guide names to the guide locations.
+  # Get guides and reference sequences in this order
+  gd_to_bam <- match(gd_nms, names(guides))
+  guides <- guides[gd_to_bam]
+  references <- references[gd_to_bam]
+  
+  # Count variants for each bam by making CrisprSet objects
+  result <- bplapply(seq_along(bams), function(i){
+    bam <- bams[i]
+    ref <- references[[i]]
+    gd <- guides[i]
+    nm <- names(gd)
+    
+    # Here we call SNVs in the entire guide region (upstream.snv = 17).
+    # The default settings call SNVs from 8 bases upstream to 6 bases downstream.
+    # This is necessary for Supplementary Note 3.
+    crispr_set <- CrispRVariants::readsToTarget(bam, gd,
+                            reference = ref, target.loc = 22,
+                            upstream.snv = 17, names = nm)
+    crispr_set
+   
+   }, BPPARAM = bpparam)
+      
+  # Name the CrisprSets according to the guides
+  names(result) <- gd_nms
+  result
+}
+```
+
+###getSplitEff
+This function gets a table of mutation efficiencies for a directory
+containing bam files where one bam file corresponds to one guide.
+It is very similar to the previous function getCrisprSets, except
+for returning only efficiencies instead of CrisprSets.
+
+```{r}
+getSplitEff <- function(directory, references, guides, primers,
+                        bpparam = BiocParallel::MulticoreParam(8)){
+  
+  bams <- list.files(directory, pattern = "*.bam$", full.names = TRUE)
+  gd_nms <- gsub(".*/(.*).bam", "\\1", bams)
+  gd_to_bam <- match(gd_nms, names(guides))
+  
+  guides <- guides[gd_to_bam]
+  references <- references[gd_to_bam]
+  
+  result <- bplapply(seq_along(bams), function(i){
+    bam <- bams[i]
+    ref <- references[[i]]
+    gd <- guides[i]
+    nm <- names(gd)
+    
+    # The guides coordinates are genomic.  Here we adjust the
+    # guide locations for local alignments by considering where
+    # the guide starts with respect to the amplicon sequence
+    if (grepl("local", directory) == TRUE){
+      primer <- primers[primers$name == nm]
+      offset <-  1 - start(primer)
+      gd <- shift(gd, offset)
+    }  
+    crispr_set <- CrispRVariants::readsToTarget(bam, gd,
+                            reference = ref, target.loc = 22)
+    if (is.null(crispr_set)) return(c(NA, NA))
+    mutationEfficiency(crispr_set)[c("Overall", "ReadCount")]
+   }, BPPARAM = bpparam)
+  
+  result <- t(data.frame(result))
+  rownames(result) <- gd_nms
+  result
+}
+
+```
+
+###parseCRISPResso
+This function extracts the (reads with NHEJ)/(total reads) % from the file named
+"Quantification_of_editing_frequency.txt" in the supplied results directory
+```{r}
+parseCRISPResso <- function(results_dir){
+  results_f <- file.path(results_dir, "Quantification_of_editing_frequency.txt")
+  system(paste0("echo '\n' >>", results_f))
+  
+  f <- file(results_f)
+  lns <- readLines(f)
+  close(f)
+  
+  nhej <- lns[grep(".* NHEJ:", lns)]
+  total <- lns[grep("Total", lns)]
+  counts <- as.numeric(gsub(".*:([0-9]+)\ .*", "\\1", c(nhej, total)))
+  result <- counts[1]/counts[2]*100
+  c(result, counts[2])
+}
+```
+
+###getLegend
+This function gets the legend from a ggplot2 object.
+This is useful for when two subplots should share a legend
+From [Stack Overflow](http://stackoverflow.com/questions/13649473/add-a-common-legend-for-combined-ggplots).
+```{r}
+getLegend<-function(a.gplot){
+  tmp <- ggplot_gtable(ggplot_build(a.gplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)}
+```
+
+
+###onTargetPercent
+This function calculates the percentage of on-target reads for every bam file
+in the given directory.  It works by selecting mapped, primary alignments 
+(-F 2048 to exclude supplementary alignments plus -F 4 to exclude unmapped 
+reads).  Both members of a pair are counted.  Using this function requires
+samtools to be installed and the bam files to be sorted and indexed.
+```{r}
+onTargetPercent <- function(directory, guides){
+  # Templates for counting on and off-target reads
+  samtools_all <- "samtools view -F 2052 %s | wc -l"
+  samtools_ontarget <- "samtools view -F 2052 %s %s:%s-%s | wc -l"
+  
+  # List all files ending in .bam
+  bams <- list.files(directory, pattern = "*.bam$", full.names = TRUE)  
+  
+  # Match file names to guide names, order guides accordingly
+  gd_nms <- gsub(".*/(.*).bam", "\\1", bams)
+  gd_to_bam <- match(gd_nms, names(guides))
+  guides <- guides[gd_to_bam]
+  
+  # Run samtools commands, get results
+  result <- lapply(seq_along(bams), function(i){
+    gd <- guides[i]
+    bm <- bams[[i]]
+    total <- as.numeric(system(sprintf(samtools_all, bm), intern = TRUE))
+    on <- as.numeric(system(sprintf(samtools_ontarget, bm, seqnames(gd)[1], 
+             start(gd), end(gd)), intern = TRUE))
+    # off-target is the difference between the total and the off-target reads
+    c("on" = on, "off" = total-on)
+    
+  })
+    
+  result <- do.call(rbind, result)
+  rownames(result) <- gd_nms
+  result
+}
+
+```
+
+###onTargetCount
+This function counts on-target reads for every bam file in the given directory.
+It works by counting the unique names of all reads mapped to a target 
+(amplicon) region. A read mapped as a chimera is considered
+on-target if any of the mapped segments overlap the target region. Using this
+function requires samtools to be installed and the bam files to be sorted and
+indexed.
+```{r}
+onTargetCount <- function(directory, primers){
+  #Template samtools command for selecting on-target reads
+  ontgt <- "samtools view -F 4 %s %s:%s-%s | awk '{print $1}' | sort | uniq | wc -l"
+  
+  # Get bam file names
+  bams <- list.files(directory, pattern = "*.bam$", full.names = TRUE)  
+  gd_nms <- gsub(".*/(.*).bam", "\\1", bams)
+  
+  # Match the primer (amplicon) regions to the file names
+  pr_to_bam <- match(gd_nms, names(primers))
+  # Order the primers accordingly
+  primers <- primers[pr_to_bam]
+
+  result <- lapply(seq_along(bams), function(i){
+    pr <- primers[i]
+    bm <- bams[[i]]
+    on <- as.numeric(system(sprintf(ontgt, bm, seqnames(pr)[1], 
+             start(pr), end(pr)), intern = TRUE))
+    on
+  })
+    
+  result <- do.call(rbind, result)
+  rownames(result) <- gd_nms
+  result
+}
+
+```
+
+
+### dotplot
+
+Produce a dotplot showing runs of homology of length at least ```min.length```
+between two sequences ```seq1``` and ```seq2``` (or within one sequence if
+only one is supplied).  Sequences must be ```Biostrings::DNAString```
+objects.  ```annotations``` are optional regions to highlight with gray
+boxes, and should be numbered with respect to seq1.
+
+Although written to allow two different sequences in future, this function
+has only been tested for identical sequences.
+```{r}
+dotplot <- function(seq1, seq2=seq1, min.length = 3,
+                    tick.alpha = 200, annotations = IRanges(),
+                    plot.title = NULL){
+  
+  if (! identical(seq1, seq2) & ! length(annotations) > 0){
+    stop("Annotation only implemented for seq1 == seq2")
+  }
+  
+  # Set of starts of each run at least min.length long
+  strts <- c(1:(length(seq2)- min.length + 1))
+  
+  # Get all motifs that occur in seq1
+  motifs <- unique(as.character(Views(seq1,
+               IRanges(start = strts, width = min.length))))
+  
+  # Split sequences into single characters
+  sq1_chr <- strsplit(as.character(seq1), "")[[1]]
+  sq2_chr <- strsplit(as.character(seq2), "")[[1]]
+  
+  # Colours for the nucleotides, to match CrispRVariants::plotVariants
+  colours <- c(rgb(77,175,74, tick.alpha, maxColorValue=255),
+               rgb(55,126,184, tick.alpha, maxColorValue=255),
+               rgb(228,26,28, tick.alpha, maxColorValue=255),
+               rgb(0,0,0, tick.alpha, maxColorValue=255),
+               rgb(128,128,128, tick.alpha, maxColorValue=255))
+  
+  names(colours) <- c("A","C","T","G","N")
+   
+  add_wdth <- c(0:(min.length-1))
+  
+  # Convert a list of homology starts to a list of dot locations
+  to_range <- function(mm, min.length, add_wdth){
+    temp <- replicate(min.length, mm)
+    as.vector(t(temp) + add_wdth)
+  }
+  
+  # Find the motifs from seq1 in seq2
+  sq2_matches <- lapply(motifs, function(x){
+    to_range(start(Biostrings::matchPattern(x, seq2)),
+             min.length, add_wdth)
+  })
+  sq2_lengths <- elementLengths(sq2_matches)/min.length
+  
+  # Check for multiple occurrences of the same motif
+  sq1_matches <- lapply(seq_along(motifs), function(i){
+    x <- motifs[i]
+    mtch <- Biostrings::matchPattern(x, seq1)
+    mtch_ln <- length(mtch)
+    mtch <- rep(start(mtch), each = sq2_lengths[i])
+    rng <- to_range(mtch, min.length, add_wdth)
+    data.frame(x = rng, y = sq2_matches[[i]])
+  })
+  
+  # Make coordinates for annotation boxes
+  # Add 1 to ends to cover from start to end of the boxes
+  bounds <- rep(Inf, length(annotations))
+  annot_box <- data.frame(xmin = c(start(annotations), -1 * bounds),
+                          xmax = c(end(annotations)+1, bounds),
+                          ymin = c(-1 * bounds, start(annotations)),
+                          ymax = c(bounds, end(annotations))+1)
+  
+  dat <- unique(do.call(rbind, sq1_matches))
+  
+  # Plotting
+  p <- ggplot(annot_box, aes(xmin = xmin, xmax=xmax,ymin=ymin,ymax=ymax)) +
+        # First make the annotation as this should be in the background
+        geom_rect(alpha = 0.5, fill= "gray") + 
+    
+    # Add the points, where each point indicates a homologous run
+    geom_point(data = dat, aes(x=x, y=y, xmin=NULL,xmax=NULL,ymin=NULL,ymax=NULL),
+               size = 0.75) + 
+    
+    # Add lines for the plot borders, 
+    # otherwise this gets lost when the nucleotides are shown
+    geom_hline(yintercept=c(0), size = 1) + geom_vline(xintercept=0, size = 1) +  
+    theme_bw() + xlab(NULL) + ylab(NULL) +
+    
+    # Set one axis tick line per nucleotide
+    scale_x_discrete(breaks = seq_along(sq1_chr)) +
+    scale_y_discrete(breaks = seq_along(sq2_chr)) +
+    
+    # Colour the axis ticks according to the nucleotide
+    theme(axis.ticks.x = element_line(colour = colours[sq1_chr], size = 1),
+        axis.ticks.y = element_line(colour = colours[sq2_chr], size = 1),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.length = unit(0.3, "cm"),
+        panel.grid.major = element_blank()) +
+    
+    # Zoom the plot to just the seq, without changing data
+    coord_cartesian(xlim = c(0, length(sq1_chr) + 1),
+                    ylim = c(0, length(sq2_chr) + 1))
+  
+  if (! is.null(plot.title)){
+    p <- p + annotate("text", label = plot.title, 
+                      x = 5, y = Inf, hjust = 0, vjust = 2)
+  }
+  return(p)
+}
+```
+
+
+### plot_variants
+
+This is similar to CrispRVariants::plotVariants, but does not include the
+transcript plot and adds a title.
+
+```{r}
+plot_variants <- function(cset, nm){
+  gene_p <- grid::grid.rect(gp=grid::gpar(col="white"), draw = FALSE)
+  alns <-  CrispRVariants::plotAlignments(cset, min.freq = 1)
+  alns <- alns + ggtitle(nm) 
+  heat <- CrispRVariants::plotFreqHeatmap(cset, min.freq = 1,
+                                  x.angle = 0, x.hjust = 0.5,
+               legend.key.height = grid::unit(1, "lines"))
+
+  return(CrispRVariants:::arrangePlots(gene_p, alns, heat, 
+              left.plot.margin = grid::unit(c(0.1,0,0.2,0.2), "lines")))
+}
+```
+
+
+### getReferenceGaps
+
+getReferenceGaps converts pairwise alignments into alignments with respect
+to a reference, and returns a list of data that can be input to
+CrispRVariants::plotVariants.matrix
+
+This function takes paired.alns, a Biostrings::PairwiseAlignments object
+of a set of reads to a reference sequence, and optionally reverse.alns, 
+a matching PairwiseAlignments object of the reverse complement reads.
+
+```{r}
+getReferenceGaps <- function(paired.alns, reverse.alns = NULL){
+  refs <- as.character(pattern(paired.alns))
+  qrys <- DNAStringSet(as.character(subject(paired.alns))) 
+  
+  # Use the reverse complement alignment when it is better
+  if (! is.null(reverse.alns)){
+    rc_better <- score(reverse.alns) > score(paired.alns)
+    refs[rc_better] <- as.character(pattern(reverse.alns))[rc_better]
+    tmp <- DNAStringSet(as.character(subject(reverse.alns)[rc_better]))
+    qrys[rc_better] <- tmp
+  }
+  
+  # Split into nucleotides
+  ref_chrs <- strsplit(refs, "")
+  
+  # Get locations of gaps in reference sequence
+  # make these into a list of insertions in the reads
+  irl <- lapply(seq_along(ref_chrs), function(i){
+     x <- ref_chrs[[i]]
+     rls <- rle(x == "-")
+     ir <- as(PartitioningByEnd(cumsum(rls$lengths)), "IRanges")
+     gap_rngs <- ir[rls$values]
+     gap_seqs <- Views(qrys[[i]], ir[rls$values])
+     ungap_qry <- paste0(Views(qrys[[i]], ir[!rls$values]), collapse = "")     
+     list(insertions = gap_rngs, ungapped = ungap_qry,
+          gap_seqs = as.character(gap_seqs))
+  })
+  qrys <- DNAStringSet(unlist(lapply(irl, "[[", "ungapped")))
+  ins <- lapply(irl, "[[", "insertions")
+  
+  # Offset the starts for the previous insertions
+  temp <- IRangesList(ins)
+  tt <- unlist(cumsum(width(temp))) # count inserted sequences
+  tt <- c(0,tt[1:(length(tt)-1)]) # offset by one to consider only previous ins
+  ee <- unlist(elementLengths(ins))
+  ee <- cumsum(ee[ee>0])
+  tt[ee[1:(length(ee)-1)] + 1] <- 0 # Zeros at the start of new reads
+  starts <- unlist(start(temp)) - tt
+  
+  # Make a table of insertions
+  insertions_t <- data.frame(start = starts, 
+                    seq = unlist(lapply(irl, "[[", "gap_seqs")),
+                    id = rep(seq_along(qrys), elementLengths(ins)))
+  
+  list(insertions = insertions_t, seqs = qrys)
+}
+```
+
+
+# Parse mutation efficiency estimates
+
+This section shows how efficiency estimates for AmpliconDIVider, CRISPResso and
+CRISPR-GA were parsed.  See GITHUB REPO?? FOR DETAILS OF HOW THESE RESULTS WERE
+CALCULATED.
+
+### AmpliconDIVider
+```{r}
+amplicon_div <- "~/ampliconDIV_filtered/merged_split_pear"
+adiv_files <- list.files(amplicon_div, pattern = "merged_split_pear",
+                         full.names = TRUE)
+
+adiv_results <- sapply(adiv_files, function(fn){
+  tt <- read.table(fn, sep = "\t")[1,c(6,2)]
+})
+colnames(adiv_results) <- gsub(".*pear_(.*$)", "\\1", colnames(adiv_results))
+adiv_counts <- unlist(adiv_results[2,])
+adiv_results <- unlist(adiv_results[1,] ) * 100 # Report as a %
+```
+
+### CRISPResso
+
+WHERE IS THE CUSTOM REFERENCE FOR CRISPRESSO LOCATED?
+
+```{r}
+# Get CRISPResso efficiency with amplicon-specific reference
+crispresso <- "~/crispresso"
+crispresso_results <- sapply(list.files(crispresso, full.names = TRUE), 
+                             parseCRISPResso)
+colnames(crispresso_results) <- basename(colnames(crispresso_results))
+crispresso_counts <- crispresso_results[2,]
+crispresso_results <- crispresso_results[1,]
+
+# Get CRISPResso-pooled efficiency
+crispresso_pooled <- "~/crispresso_pooled_mixed"
+pooled_results <- sapply(list.files(crispresso_pooled, pattern = "CRISPResso_on", 
+                        full.names = TRUE), parseCRISPResso)
+colnames(pooled_results) <- gsub(".*_on_", "", colnames(pooled_results))
+crispresso_pooled_counts <- pooled_results[2,]
+crispresso_pooled_results <- pooled_results[1,]
+
+# Get CRISPResso efficiency with standard reference
+std <- "~/crispresso_std_ref"
+std_results <- sapply(list.files(std, full.names = TRUE), parseCRISPResso)
+colnames(std_results) <- basename(colnames(std_results))
+crispresso_std_counts <- std_results[2,]
+crispresso_std_results <- std_results[1,]
+
+# Get CRISPResso efficiency with standard reference, merged reads
+mrged <- "~/crispresso_std_ref_merged"
+mrged_results <- sapply(list.files(mrged, full.names = TRUE), parseCRISPResso)
+colnames(mrged_results) <- basename(colnames(mrged_results))
+crispresso_mrged_counts <- mrged_results[2,]
+crispresso_mrged_results <- mrged_results[1,]
+
+
+nms <- unique(c(names(crispresso_pooled_results),
+                names(crispresso_results),
+                names(crispresso_std_results),
+                names(crispresso_mrged_results)))
+crispresso_dat <- data.frame(crispresso_results[nms],
+                  crispresso_std_results[nms],
+                  crispresso_mrged_results[nms])
+
+rownames(crispresso_dat) <- nms
+crispresso_dat <- cbind(crispresso_dat, crispresso_pooled_results[nms])
+colnames(crispresso_dat) <- c("Custom ref", "Std ref", "Merged", "Pooled")
+```
+
+
+### CRISPR-GA
+```{r}
+cga <- "~/crisprga/fwd_only_pear_crisprga_refonly.txt"
+temp <- read.table(cga, sep = "\t", header = TRUE)
+crisprga <- temp$crisprga
+names(crisprga) <- temp$name
+
+cga_w_ref <- "~/crisprga/crisprga_w_guide_fwd_only_pear.txt"
+temp <- read.table(cga_w_ref, sep = "\t", header = TRUE)
+crisprga_w_ref <- temp$w_guide
+names(crisprga_w_ref) <- temp$name
+```
+
+
+# Supplementary Note 5: Local alignment is affected by PCR off-target reads and can inflate efficiency estimates
+
+### Plot reads aligned on- and off-target
+
+This plot counts the number of reads for each guide mapped by bwa that do
+and do not overlap the guide regions.  Pooled reads were separated by guide
+by matching the PCR primer sequences.
+
+```{r, fig.height = 2.5}
+
+result <- onTargetPercent(merged_split_pear, guides)
+result <- reshape2::melt(result)
+
+ggplot(result, aes(x = Var1, y=value, group=Var2, fill=Var2)) + 
+# Stack counts for on- and off-target reads, don't transform to percentage
+geom_bar(position = "stack", stat= "identity") + theme_bw() + xlab(NULL) + 
+ ylab("Reads mapped") + 
+theme(axis.text.x = element_text(angle = 90, size = 7, hjust = 1, vjust = 0.5),
+      legend.position = "bottom", legend.text = element_text(size = 8),
+      legend.key.height = grid::unit(0.4, "cm"),
+      legend.margin = grid::unit(0.05, "cm"),
+      plot.margin = grid::unit(c(0.1,0.5,0.1,0,1), "lines")) + 
+scale_y_continuous(labels = comma) + 
+scale_fill_manual("", values = c("steel blue", "red"),
+                  labels = c("on-target", "off-target"))
+```
+
+### Comparison of local and global alignment strategies
+
+```{r, cache=TRUE}
+# Calculate CrispRVariants efficiencies
+directories <- c(merged_split_pear, blat_global, blat_local)
+dir_nms <- c("BWA mem", "Blat global", "Blat local")
+
+effs <- lapply(directories, getSplitEff, 
+               references = references, guides = guides,
+               primers = primers)
+effs <- do.call(cbind, effs)
+effs <- data.frame(effs)
+colnames(effs) <- paste(rep(dir_nms, each=2), c("efficiency", "reads"))
+crv_counts <- effs[, grep("reads", colnames(effs)), drop = FALSE]
+effs <- effs[, grep("efficiency", colnames(effs)), drop = FALSE]
+
+# Merge results
+effs[,"CRISPR-GA efficiency"] <- crisprga[rownames(effs)]
+effs[,"CRISPR-GA efficiency (inc guide)"] <- crisprga_w_ref[rownames(effs)]
+effs[,"AmpliconDIVider efficiency"] <- adiv_results[rownames(effs)]
+effs[,"CRISPResso efficiency"] <- crispresso_results[rownames(effs)]
+
+print(head(effs))
+
+# Order by column medians, from highest to lowest
+effs <- effs[order(apply(effs,1, median, na.rm = TRUE),
+             decreasing = TRUE), ]
+
+# Store the order and the medians, these are reused in other figures
+sgrna_order <- rownames(effs)
+meds <- data.frame("sgRNA" = rownames(effs), 
+         "medians" = apply(effs[,2:ncol(effs)],1, median, na.rm = TRUE))
+meds$sgRNA <- factor(meds$sgRNA, levels = rownames(effs))
+
+
+print(head(effs))
+
+# Calculate the difference between the CrispRVariants estimates and the others.
+# (Plotted in Figure 11 b.)
+effs <- cbind(rownames(effs), effs)
+diff_from_crv <- apply(effs[,3:ncol(effs)], 2, function(x) x - effs[,2])
+diffs <- reshape2::melt(diff_from_crv)
+```
+
+
+```{r, fig.height = 9}
+# Create plot comparing efficiencies between methods
+
+# Reorder columns so CrispRVariants plots on top
+effs <- effs[,c(1,8,7,6,5,4,3,2)] 
+
+# Reformat into long format for plotting with ggplot2
+m <- melt(effs)
+colnames(m) <- c("sgRNA", "Condition", "Efficiency")
+m$sgRNA <- factor(m$sgRNA, levels = rownames(effs))
+m$Condition <- factor(m$Condition, levels = rev(unique(m$Condition)))
+print(head(m))
+
+# Colour-blind safe palette with seven rainbow colours
+sevenPalette <- c("#D92120","#E77C30","#D8Af3D","#91BD61",
+                  "#4B91C0","#3F56A7","#781C81")
+
+# Labels for legend
+cnd_nms <- c("1. CrispRVariants (BWA MEM)","2. CrispRVariants (BLAT global)",
+             "3. CrispRVariants (BLAT local)", "4. CRISPR-GA", 
+             "5. CRISPR-GA with guide", 
+             "6. AmpliconDIVider (BWA MEM)","7. CRISPResso")
+
+# Find the rows which are mentioned specifically in the text of 
+# Supplementary Material text
+annot <- which(rownames(effs) %in% c("gjd1a_off01", "tjp1b_L", 
+               "tjp2a","gjd1b","nrxn1b_S"))
+
+# Make a data from of coordinates for the guides to be highlighted
+annot <- data.frame(xmin = annot-0.4, xmax=annot+0.4, ymin = -Inf, ymax=Inf)
+
+# Convert to numeric for using scale_x_continuous
+# (just for easier formatting of the plot)
+m$sgRNA <- as.numeric(m$sgRNA)
+
+
+# Plot the mutation efficiency estimates
+p1 <- ggplot(m, aes(x=sgRNA, y=Efficiency, group=Condition)) + 
+  # Highlight the guides discuessed in the text
+  geom_rect(data = annot, aes(xmin=xmin,xmax=xmax,ymin=ymin,ymax=ymax,
+            group=NULL, x=NULL,y=NULL), alpha = 0.5, fill = "light gray") + 
+  # Add jitter for visibility
+  geom_jitter(size=2.5, alpha = 0.8, height = 0, width = 0.2, aes(color=Condition)) + 
+  theme_bw() + ggtitle('a.') +
+  theme(plot.title=element_text(hjust=-0.1),
+        axis.text.x = element_text(angle=90, hjust = 1, vjust = 0.5, size = 7),
+        legend.position="bottom", legend.title=element_blank(),
+        legend.key=element_blank(),
+        plot.margin = grid::unit(c(0.2,0.5,0,0.5), "cm")) +
+  ylab("Mutation Efficiency (%)") +
+
+  # Manually set colour and labels
+  scale_colour_manual(labels = c(cnd_nms), values=sevenPalette) +
+  
+  # Set x labels, remove axis padding
+  scale_x_continuous(breaks = seq_along(rownames(effs)),
+        labels = rownames(effs), expand = c(0,0))+
+  guides(color = guide_legend(ncol=2), title=NULL)
+
+shared_legend <- getLegend(p1)
+
+
+# Plot the difference between the CrispRVariants estimates and the others
+p2 <- ggplot(diffs, aes(x = Var2, y = value, fill = Var2)) + 
+  # Violin plot showing the distribution
+  geom_violin(alpha = 0.5) +
+  # Jittered points showing all estimates
+  geom_jitter(aes(color = Var2), alpha = 0.8)  + theme_bw() + 
+  ggtitle('b.') + 
+  theme(plot.title=element_text(hjust=-0.1),
+        axis.text.x = element_text(size = 14),
+        axis.title.x = element_blank(),
+        legend.position = "none",
+        plot.margin = grid::unit(c(0.5,0.5,0,0.5), "cm")) +
+  ylab("Eff - Eff(CrispRVariants BWA MEM)") + 
+  # Use the same palette minus the first colour for CrispRVariants
+  scale_fill_manual(values=sevenPalette[2:7]) +
+  scale_color_manual(values=sevenPalette[2:7]) +
+  scale_x_discrete(labels = c(2:7)) 
+
+# Arrange the two plots with the shared legend
+p3 <- grid.arrange(arrangeGrob(p1 + theme(legend.position="none"),
+                         p2 + theme(legend.position="none"),
+                         nrow=2),
+             shared_legend, nrow=2,heights=c(10, 1.5), newpage = FALSE)
+
+```
+
+### Dotplot showing homology within the amplicon sequence for *gjd1a_off01*
+
+```{r, fig.height = 5, fig.width = 5, fig.align='center', cache = TRUE}
+# Get the primer and guide locations
+pr <- primers[primers$name == "gjd1a_off01"]
+gd <- guides[guides$name == "gjd1a_off01"]
+
+# Get the amplicon sequence, select first to make a DNAString object
+sq <- getSeq(danRer7, pr)[[1]]
+
+# Shift guide location to be with respect to start of the amplicon
+annot <- shift(gd, -1 * start(pr) + 1)
+
+# Make the dotplot for runs of at least 6 with no mismatches
+p <- dotplot(sq, annotations = annot, min.length = 6,
+             plot.title = "gjd1a_off01")
+p
+```
+
+### Plot showing number of reads contributing to efficiency calcuations
+
+In this section, the number of reads mapped by **bwa mem** to the amplicon
+sequences is counted.  If a program counts members of a read pair separately,
+counts would be consistently 100% greater than the mapped counts.
+CRISPResso uses **bowtie2** rather than **bwa mem**. We checked the number of
+reads mapped by each tool. The number of reads mapped does not differ
+substantially although the alignments themselves do.
+
+```{r, fig.height = 3.5, cache = TRUE}
+
+# Count number of unique reads mapped to amplicons
+result <- onTargetCount(merged_split_pear, primers)
+identical(rownames(result), rownames(crv_counts))
+
+# Make a data frame of read counts reported by each method
+counts <- do.call(cbind, list(crv_counts, adiv_counts[rownames(crv_counts)],
+                  crispresso_std_counts[rownames(crv_counts)],
+                  crispresso_pooled_counts[rownames(crv_counts)]))
+colnames(counts) <- c(colnames(crv_counts), "AmpliconDIVider", 
+                     "CRISPResso","CRISPRessoPooled")
+
+# Calculate the percentage of the reads aligned to the amplicon
+# that contribute to the count
+counts <- result - counts
+counts <- as.matrix(counts)/result[,1] * 100
+
+# These are the five of the seven conditions that report counts
+# (for consistent colours between points).  CRISPRessoPooled
+# additionally included in this table.
+cnds_w_counts <- c(1,2,3,6,7)
+cnts <- melt(counts)
+
+# Use asinh transformation for symmetrically compressing the larger
+# data values when plotting
+asinh_trans <- function(){
+  trans_new(name = 'asinh', transform = function(x) asinh(x), 
+            inverse = function(x) sinh(x))
+}
+
+# Disable exponential notation
+options(scipen = 999)
+ybreaks <- c(-300, -100, -50, -10, -1,1, 10, 50, 100)
+
+# Annotate gjd1a_off01 in the BLAT 
+annot <- cnts[cnts$Var1 == "gjd1a_off01" & 
+                cnts$Var2 == "Blat global reads","value"]
+
+p1 <- ggplot(cnts, aes(x = Var2, y = value, fill = Var2)) +
+  # Violin plot of overall distribution
+  geom_violin(alpha = 0.5) +
+  # Plot individual points with jitter for visibility
+  geom_jitter(aes(color = Var2), alpha = 0.8)  + theme_bw() + 
+  # Horizontal line at y = 0
+  geom_hline(yintercept=0) + 
+
+  theme(plot.title=element_text(hjust=-0.1),
+        axis.text.x = element_text(size = 14),
+        axis.title.x = element_blank(),
+        axis.title.y = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        legend.position = "bottom",
+        legend.key=element_blank(),
+        plot.margin = grid::unit(c(0.5,0.5,0,0.5), "cm")) +
+
+  ylab(expression(frac(Mapped - Counted, Mapped)~"%")) +
+  
+  # Add colours and labels for CRISPRessoPooled
+  scale_color_manual(values=c(sevenPalette[cnds_w_counts],"#009E73"),
+                     labels = c(cnd_nms[cnds_w_counts],
+                                "8. CRISPRessoPooled")) +
+  scale_fill_manual(guide = FALSE,
+                    values=c(sevenPalette[cnds_w_counts], "#009E73")) + 
+  scale_x_discrete(labels = c(cnds_w_counts,"8")) + 
+  
+  # Transform the y axis to compress the large ranges
+  scale_y_continuous(trans = "asinh", breaks = ybreaks,
+                     labels = as.character(ybreaks)) +
+
+  guides(color = guide_legend(ncol=2, title = NULL)) +
+  annotate("text", label = "gjd1a_off01", x = 2, y = annot, size = 3, hjust = 1)
+  
+p1
+
+```
+
+
+# Supplementary Note 9: Background to the data and tools used
+
+```{r, fig.height = 3}
+
+shah_results <- read.table("../annotation/Shah_metadata_edited.txt", sep = "\t",
+                           header = TRUE)
+guide_nms <- gsub("\ ", "", shah_results$Gene)
+
+compare_effs <- effs[,c("CRISPR-GA efficiency (inc guide)",
+                        "CRISPR-GA efficiency","BWA mem efficiency")]
+
+compare_effs <- cbind(rownames(compare_effs), compare_effs) 
+colnames(compare_effs) <- c("sgRNA", "CRISPR-GA (inc guide)",
+                            "CRISPR-GA", "CrispRVariants")
+original_eff <- shah_results$Efficiency
+names(original_eff) <- shah_results$Gene
+
+m <- melt(compare_effs)
+m$Original <- original_eff[m$sgRNA]
+
+ggplot(m, aes(x=Original, y=value, fill = variable)) +
+     geom_abline(slope = 1, colour = "red", size = 0.5) +
+     geom_point(size = 2, shape = 21, alpha = 0.9) + 
+     facet_grid(~variable) + 
+xlab("Shah efficiency estimates") + 
+ylab("Replicated efficiency estimates") + theme_bw() + 
+theme(axis.title.x=element_text(vjust=-0.5),
+      axis.title.y=element_text(vjust=1)) +
+scale_fill_manual(values = c("#4B91C0","#91BD61","#D92120"), guide = FALSE)
+
+```
+
+
+
+
+# Supplementary Note 6: Merging paired reads affects efficiency estimates by non-randomly filtering reads
+
+
+```{r}
+
+# Setup conditions, condition names and plotting colours
+directories <- c(merged_seqprep, merged_split_l55, 
+                 merged_split_pear, split_merged_pear,
+                 tolerant_pear, strict_pear)
+
+cnd_nms <- c("1. Unmerged","2. Merged (SeqPrep)",
+             "3. SeqPrep (merge-then-split)","4. SeqPrep (length 50, merge-then-split)",
+             "5. PEAR (merge-then-split)","6. PEAR (split-then-merge)", 
+             "7. PEAR (tolerant)", "8. PEAR (strict)")
+
+cbbPalette <- c("#000000", "#E69F00", "#56B4E9", "#009E73", 
+                "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+```
+
+
+We first calculate mutation efficiencies for the two unsplit bam files.
+Here we use CrispRVariants::readsToTargets as there are reads from
+multiple targets in each bam file.
+
+```{r, cache = TRUE}
+
+# Unmerged = reads mapped as pairs
+bpparam = BiocParallel::MulticoreParam(8)
+originals <- readsToTargets(unmerged, targets = guides, references = references,
+                     target.loc = 22, collapse.pairs = TRUE, bpparam = bpparam,
+                     verbose = FALSE)
+original_effs <- data.frame(t(sapply(originals, function(crispr_set){
+  mutationEfficiency(crispr_set)[c("Overall", "ReadCount")]})))
+
+rm(originals)
+invisible(gc())
+
+# Merged = reads merged
+merged_csets <- readsToTargets(merged, targets = guides, references = references,
+                     target.loc = 22, collapse.pairs = FALSE, bpparam = bpparam,
+                     verbose = FALSE)
+
+merged_effs <- data.frame(t(sapply(merged_csets, function(crispr_set){
+  mutationEfficiency(crispr_set)[c("Overall", "ReadCount")]})))
+
+rm(merged_csets)
+invisible(gc())
+
+```
+
+We next get the mutation efficiencies for the reads split by guide,
+as in Supplementary Note 5.
+
+```{r, cache = TRUE}
+
+split_effs <- lapply(directories, getSplitEff,
+                     references = references, guides =  guides,
+                     primers = primers)
+
+# Make a data frame of the results, checking that order is consistent
+effs <- cbind(original_effs[rownames(split_effs[[1]]),], 
+         merged_effs[rownames(split_effs[[1]]),], split_effs)
+cols <- rep(c(c("Original", "Merged"), basename(directories)), each = 2)
+colnames(effs) <- paste0(cols, c("Eff", "ReadCount"))
+
+# Split into read counts and mutation efficiencies
+counts <- effs[,grep("ReadCount", colnames(effs))]
+effs <- effs[,grep("Eff", colnames(effs))]
+
+# Order by median as in Supplementary Note 5, format for plotting
+effs <- cbind(sgRNA = rownames(effs), effs)
+effs$sgRNA <- factor(effs$sgRNA, levels = sgrna_order)
+m <- melt(effs)
+
+# Check how different the efficiency estimates are from
+# those for the unprocessed data
+
+ee <- effs[,2:9]
+mins <- apply(ee, 1, min, na.rm = TRUE)
+maxs <- apply(ee, 1, max, na.rm = TRUE)
+table(maxs - mins > 10)
+
+# Plot 
+ggplot(m, aes(x=sgRNA, y=value, group=variable)) + 
+  geom_rect(xmin=17.4, xmax=18.4, ymin=-Inf, alpha = 0.2,
+             ymax=Inf, fill = "light gray") +  # highlight the outlier
+  geom_jitter(size=2.5, alpha = 0.8, height = 0, width = 0.1, aes(color=variable)) +
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle=90, hjust = 1, vjust = 0.5, size = 7),
+        legend.position="bottom", legend.title=element_blank(),
+        legend.key=element_blank(), 
+        plot.margin = grid::unit(c(0.2,0.2,0,0.5), "lines")) + 
+        ylab("Mutation efficiency (%)") + 
+  scale_colour_manual(labels = c(cnd_nms), values=cbbPalette) +
+  guides(color = guide_legend(ncol=2), title=NULL)
+
+```
+
+
+# Supplementary Note 7: Data preprocessing affects efficiency estimates
+
+### Effect of preprocessing on CRISPR-GA estimates
+
+
+```{r}
+crisprga <- "~/crisprga"
+
+fnms <- c("seqprep_originals.txt",
+          "fwd_only_pear_crisprga_refonly.txt",
+          "tolerant_pear_crisprga_refonly.txt",
+          "strict_pear_crisprga_refonly.txt")
+            
+get_cga <- function(fname, cga_dir = crisprga){
+  temp <- read.table(file.path(cga_dir,fname), sep = "\t", header = TRUE)
+  crisprga <- temp$crisprga
+  names(crisprga) <- temp$name
+  crisprga
+}            
+
+effs <- lapply(fnms, function(nm) get_cga(nm))
+effs <- lapply(effs, function(x) x[names(effs[[1]])])
+
+effs <- data.frame(do.call(cbind, effs))
+colnames(effs) <- gsub("merged_|split_", "", fnms)
+effs <- effs[order(apply(effs[,1:ncol(effs)],1, median, na.rm = TRUE),
+             decreasing = TRUE), ]
+effs <- cbind(sgRNA = rownames(effs), effs)
+effs$sgRNA <- factor(effs$sgRNA, levels = effs$sgRNA)
+
+m <- melt(effs)
+
+ggplot(m, aes(x=sgRNA, y=value, group=variable, color=variable)) + 
+  geom_jitter(size=2.5, alpha = 0.8, height = 0, width = 0.2) + theme_bw() + 
+  theme(axis.text.x = element_text(angle=90, hjust = 1, vjust = 0.5, size = 7),
+        legend.position="bottom", legend.title=element_blank(),
+        legend.key=element_blank(), 
+        plot.margin = grid::unit(c(0.2,0.2,0,0.5), "lines")) + 
+        ylab("Mutation efficiency (%)") + 
+  scale_colour_manual(labels = c(cnd_nms)[c(3,5,7,8)], values=cbbPalette[c(3,5,7,8)]) +
+  guides(color = guide_legend(ncol=2), title=NULL)
+
+```
+
+
+### Effect of preprocessing on CRISPResso estimates
+
+```{r}
+
+cnd_nms <- c("1. CRISPResso default", "2. CRISPRessoPooled",
+             "3. CRISPResso (Merged with PEAR)", 
+             "4. CRISPResso default (corrected reference)")
+
+cbbPalette <- c("#000000", "#009E73", "#56B4E9", "#E69F00")
+
+# Reorder as in local-global comparison
+crispresso_dat <- crispresso_dat[sgrna_order, c(1,4,3,2)]
+crispresso_dat <- cbind(rownames(crispresso_dat), crispresso_dat)
+m <- melt(crispresso_dat)
+colnames(m) <- c("sgRNA","Condition","Efficiency")
+m$sgRNA <- factor(m$sgRNA, levels = sgrna_order)
+
+# Note that data.frame meds was created in the local-global comparison
+
+p1 <- ggplot(meds, aes(x=sgRNA)) + 
+  geom_line(aes(y = medians,group = 1), color = "gray") + 
+  geom_jitter(data = m, aes(group = Condition, y=Efficiency, color=Condition), 
+              size=2.5, alpha = 0.8, height = 0, width = 0.2) + theme_bw() + 
+  theme(plot.title=element_text(hjust=-0.1),
+        axis.text.x = element_text(angle=90, hjust = 1, vjust = 0.5, size = 7),
+        legend.position="bottom", legend.title=element_blank(),
+        legend.key=element_blank(), plot.margin = grid::unit(c(0.2,0.5,0,0.5), "cm")) +
+  ylab("Mutation Efficiency (%)") + 
+  scale_colour_manual(labels = c(cnd_nms), values=cbbPalette) +
+  guides(color = guide_legend(ncol=2), title=NULL)
+p1
+
+```
+
+
+
+
+
+
+
+# Supplementary Note 1: Localising variants facilitates comparison of sgRNAs
+
+The CrispRVariants representation of variant alleles allows variant spectra to be directly compared between guides.  There are many possible ways to compare spectra.  Here we compare variant location with variant type.
+
+```{r}
+csets <- getCrisprSets(merged_split_pear, references, guides)
+# Keep on-target guides only
+on_tgt <- !grepl("off", names(csets))
+
+
+# Select frequent variants, extract locations and variant types
+dat <- lapply(seq_along(csets[on_tgt]), function(i){
+  nm <- names(csets[on_tgt])[[i]]
+  
+  # Get a table of proportions for variants at least 2% frequent,
+  # including only indel variants and excluding chimeras
+  vc <- CrispRVariants::variantCounts(csets[on_tgt][[i]], min.freq = 2,
+     result = "proportions", include.nonindel = FALSE,
+     include.chimeras = FALSE) 
+  
+  if (length(vc) == 0) return(NULL)
+  
+  # Exclude complex variants, i.e. variants with two different indels.
+  # Variants are represened as location:variant, split the names
+  complex_var <- grepl(",", rownames(vc))
+  temp <- strsplit(rownames(vc)[!complex_var], ":")
+  loc <- as.numeric(lapply(temp, "[[", 1))
+  variant <- sapply(temp, "[[", 2)
+  
+  # Make a table of variant location, type, frequency and guide names
+  result <- data.frame("Location" = loc, "Variant" = variant, 
+                       "Frequency" = vc[!complex_var,1], "sgRNA" = nm)
+  result
+})
+
+# Merge results into a single table
+dat <- do.call(rbind, dat)
+
+# Exclude gjd2a as the mapped variants do not correspond to the mapped guide,
+# possibly indicating something wrong with the mapping
+dat <- dat[dat$sgRNA != "gjd2a",]
+
+# Collapse large deletions (15 bases or more) into a single category
+large_del <- as.numeric(gsub("D", "", dat$Variant)) >= 15
+large_del[is.na(large_del)] <- FALSE 
+dat$Variant <- as.character(dat$Variant)
+dat$Variant[large_del] <- "Large deletion"
+
+# For visibility, order so that the largest frequencies plot first
+dat <- dat[order(dat$Frequency, decreasing = TRUE),]
+```
+
+Create plot for Supplementary Note 1.
+
+```{r, fig.height = 4}
+
+# This is a large, colour-blind safe palette.
+large_palette <- c("#771155","#AA4488","#CC99BB","#114477","#4477AA",
+                   "#77AADD","#117777", "#44AAAA","#77CCCC","#117744",
+                   "#44AA77","#88CCAA","#777711","#AAAA44",
+                   "#DDDD77","#774411","#AA7744","#DDAA77",
+                   "#771122","#AA4455","#DD7788")
+
+# Extrapolate palette to the number of guides
+pal <- colorRampPalette(large_palette)(length(unique(dat$sgRNA)))
+
+# Set up the labels for the axes.  Note that I previously the
+# range of the data before setting this range.
+temp <- c(-14:-1, 1)
+is_del <- temp < 0
+temp[is_del] <- gsub("-", "", paste0(temp[is_del], "D"))
+is_ins <- !is_del 
+temp[is_ins] <- paste0(temp[is_ins], "I")
+temp <- c("Large deletion", temp)
+
+# Convert Location and Variant to factors, set the order
+dat$Location <- factor(dat$Location, levels = c(-25:5))
+dat$Variant <- factor(dat$Variant, levels = temp)
+
+# Create the plot, using position_jitter to make points more visible
+ggplot(dat, aes(x = Location, y = Variant,  color=sgRNA)) +
+ geom_point(aes(size = Frequency), 
+            position=position_jitter(width = 0.1, height = 0.1),
+      alpha = 0.9) + theme_bw() +
+      geom_vline(xintercept = 26, color = "darkgray", size = 0.5) + 
+
+# Don't drop unused categories from the axes
+scale_x_discrete(drop=FALSE) + scale_y_discrete(drop=FALSE) + 
+theme(axis.text.x = element_text(size = 7, hjust = 0.5, angle = 45),
+      axis.text.y = element_text(size = 8),
+      legend.key = element_blank()) + 
+
+# Make a guide for colour but not for size
+guides(color=guide_legend(ncol=2, title=  NULL)) +
+  scale_size_continuous(guide = FALSE) +
+  
+# Manually set colours to the chosen palette
+scale_color_manual(values = pal)
+
+```
+
+
+
+
+
+
+
+
+# Supplementary Note 3: CrispRVariants can detect and adjust efficiency estimates to account for genomic variants
+
+This analysis is based on the merged-split-pear preprocessing pipeline.  We can use the CrisprSet objects created for Supplementary Note 1.
+
+### Plot heterozygous 2bp deletion
+
+```{r, fig.height = 3}
+
+# One heterozygous 2bp deletion was detected by looking at the allele 
+# summary plots.  Plot the alleles for this guide (gjd1a_off01)
+f <- csets[["gjd1a_off01"]]
+plotVariants(cset, plotAlignments.args = list(min.freq = 1),
+              plotFreqHeatmap.args = list(min.freq = 1, x.angle = 55))
+
+# Identify SNVs with frequency at least 0.2
+existing_snps <- unlist(sapply(csets, function(cset) findSNVs(cset, freq = 0.2)))
+existing_snps
+
+# Make a list of SNVs to remove per guide
+snps <- do.call(rbind, strsplit(names(existing_snps), "\\."))
+colnames(snps) <- c("guide", "location")
+snps[,"location"] <- paste0("SNV:", snps[,"location"])
+remove_snps <- split(snps[,"location"], snps[,"guide"])
+remove_snps
+
+# Add the 2bp deletion to this list
+remove_snps["gjd1a_off01"] <- "8:2D"
+
+# Calculate the original mutation efficiency
+efficiency <- sapply(csets, function(x) mutationEfficiency(x)[["Overall"]])
+
+# Re-calculate mutation efficiency, removing the identified SNPs
+efficiency_custom <- sapply(names(csets), function(x){
+   eff <- mutationEfficiency(csets[[x]], filter.vars = remove_snps[[x]])
+   eff[["Overall"]]
+})
+
+```
+
+
+### Plot the efficiency estimates before and after adjusting for SNPs
+
+```{r, fig.height = 5}
+# Plot the original and re-estimated mutation efficiency estimates
+
+snp <- data.frame("Original" = efficiency, "Adjusted" = efficiency_custom)
+snp <- cbind("sgRNA" = rownames(snp), snp) 
+
+#Re-order SNPs to match the Supplementary Note 5
+snp <- snp[sgrna_order,]
+
+snpm <- reshape2::melt(snp)
+# Remove re-calculated estimates that don't change
+snpm <- snpm[(snpm$sgRNA %in% names(remove_snps)|snpm$variable == "Original"), ] 
+snpm$sgRNA <- factor(snpm$sgRNA, levels = sgrna_order)
+
+lns <- snp[names(remove_snps),] 
+
+ggplot(snpm) + geom_point(size=3,aes(x=sgRNA, y=value, color=variable)) +
+  geom_segment(data = lns, aes(x=sgRNA, xend=sgRNA, y=Original,yend=Adjusted),
+               arrow = arrow(length = unit(0.1,"cm")), size = 0.3) + 
+  theme_bw() + ylab("Mutation efficiency (%)") +
+  theme(axis.text.x = element_text(angle=90, hjust = 1, vjust = 0.5, size = 7)) +
+  scale_color_manual(values=c("gray","red")) + guides(color = FALSE) 
+
+```
+
+### Plot the off-target guides with SNPs
+
+```{r, fig.show = 'hide'}
+p1 <- plot_variants(csets[["gjd1a_off02"]], "gjd1a_off02")
+p2 <- plot_variants(csets[["gjd1a_off03"]], "gjd1a_off03")
+p3 <- plot_variants(csets[["gjd2a_off01"]], "gjd2a_off01")
+p4 <- plot_variants(csets[["tjp1b_B_off01"]], "tjp1b_B_off01")
+```
+
+
+```{r, fig.height = 8,}
+p5 <- grid.arrange(arrangeGrob(p1,p2,p3,p4, nrow = 4), newpage = FALSE)
+```
+
+
+
+# Supplementary Note 2: Sequencing errors and alignment uncertainty affect variant count, placement and size
+
+This section uses two examples of Sanger sequencing data and one example of MiSeq data from Burger *et al* (in review) to show how alignment issues can affect results.
+
+The MiSeq data is available from [ArrayExpress](https://www.ebi.ac.uk/arrayexpress/) with accession E-MTAB-4143.
+
+# Creating the txdb
+
+```{r}
+```
+
+
+## TO DO CLEANUP UNUSED OBJECTS FROM R SPACE
+
+# Supplementary Note 4: A synthetic data set for benchmarking CRISPR sequencing analysis tools
+
+The synthetic data set is included in the CrispRVariants package as raw and mapped
+reads.  The guide is available in bed format.
+
+### Pairwise-align synthetic data and plot using CrispRVariants
+
+This section demonstrates how to plot data using CrispRVariants::plotVariants.matrix,
+i.e., without making a CrisprSet object.
+
+```{r}
+library(ShortRead)
+
+amp <- paste0("GGGACTTTAAAGCGCAGTTCCTCACAGTGCTTAAAAGGTAAATCCTCTCGA",
+              "GGGGAAGTGATAAAAATAAGCTTACAACTGAGTTCTAGGCGAATGAAGTCG",
+              "GGGTTGCCCAGGTTCTCCAGAAAGACTCCGTGTGAAGCCGATGTCTTGAAA",
+              "TAAAAGGACATATCAGCACTGGTCTCAGCTTGTAAGGTTGGAAAATGAAGA",
+              "TAAGATGCAGGTGTGTTGAAAGAAGCAGCGTTCC")
+
+amp <- Biostrings::DNAString(amp)
+
+test_fastq <- system.file("extdata", "cntnap2b_test_data.fastq.gz",
+                        package = "CrispRVariants")
+
+# Read the fastq file, format the names
+sr <- ShortRead::readFastq(test_fastq)
+reads <- ShortRead::sread(sr)
+names(reads) <- gsub("cntnap2b_", "", id(sr))
+
+# Make Needleman-Wunsch pairwise alignments of the amplicon sequence to the
+# reads and their reverse complements
+pa <- Biostrings::pairwiseAlignment(DNAStringSet(replicate(length(reads), amp)),
+                                    reads)
+rc <- Biostrings::pairwiseAlignment(DNAStringSet(replicate(length(reads), amp)), 
+                        ShortRead::reverseComplement(reads))
+
+# Format pairwise alignments for CrispRVariants::plotVariants
+result <- getReferenceGaps(pa, reverse.alns = rc)
+names(result$seqs) <- names(reads)
+reads <- as.character(result$seqs)
+id_to_nm <- names(reads)
+names(id_to_nm) <- seq_along(reads)
+
+# The "cigar" column should match the row names of the plot,
+# in this case these are individual reads, not sets of reads
+result$insertions$cigar <- id_to_nm[result$insertions$id]
+result$insertions$count <- 1
+
+# Order the reads by the size of the mutation
+read_order <- c("amplicon_rc","amplicon_w_snps","mismatches_outside_guide",
+    "mismatch_pos1","mismatch_pos2_of_PAM","2bp_del_outside_guide",
+    "1_bp_del_offtarget_2_bp_del_in_guide","2bp_del_in_guide_away_from_cut",
+    "3bp_del_pos1","3bp_del_pos2","7bp_deletion_pos1","3bp_insertion_pos1",
+    "3bp_insertion_pos2","10bp_insertion_pos2_1","10bp_insertion_pos2_2",
+    "20bp_ins_pos1","large_deletion_upstream","large_deletion_at_cut",
+    "guide_in_centre_of_large_deletion","very_large_deletion",
+    "offtarget1","offtarget2","offtarget3","offtarget6","offtarget4",
+    "offtarget5","offtarget7","offtarget8","offtarget9","offtarget10")
+
+reads <- reads[read_order]
+
+```
+
+
+```{r}
+# Plot the pairwise alignments using CrispRVariants::plotVariants.matrix
+
+p <- plotAlignments(amp, alns = reads, ins.sites = result$insertions,
+               pam.start = 112, pam.end = 114, target.loc = 108,
+               legend.cols = 8, plot.text.size = 1.5, axis.text.size = 6,
+               legend.symbol.size = 3, legend.text.size = 5, line.weight = 0.5)
+p <- p + theme(plot.margin = grid::unit(c(0.3,0.3,0,0.3), "lines"),
+               legend.margin = grid::unit(0, "lines"),
+               axis.ticks = element_blank())
+```
+
+\newpage
+```{r, fig.width = 8, fig.height = 7, out.extra='angle=90'}
+p
+```
+\newpage
+
+### CrispRVariants results on the synthetic data set
+
+For showing how CrispRVariants behaves on the synthetic data set,
+we wish to see how individual reads are treated, including reads that
+were filtered out, i.e. do not occur in the CrisprSet object. 
+
+In other words, here we will add extra alleles to plotAlignments,
+create a custom heatmap, and combine the plots as in
+CrispRVariants::plotVariants.
+
+The following code creates an alignment plot with an extra blank row.
+
+
+```{r}
+library("BSgenome.Drerio.UCSC.danRer7")
+library("rtracklayer")
+
+# Load the danRer7 / Zv9 genome
+danRer7 <- BSgenome.Drerio.UCSC.danRer7
+
+test_bam <- system.file("extdata", "cntnap2b_test_data_s.bam",
+                        package = "CrispRVariants")
+test_guide <- system.file("extdata", "cntnap2b_test_data_guide.bed",
+                        package = "CrispRVariants")
+
+guide <- rtracklayer::import(test_guide)
+guide <- guide + 5
+reference <- getSeq(danRer7, guide)[[1]]
+
+cset <- CrispRVariants::readsToTarget(test_bam, guide,
+                reference = reference, target.loc = 22)
+
+# Get the alignments
+alns <- cset$crispr_runs[[1]]$alns
+
+# Check that there are no chimeric alignments
+! isTRUE(cset$crispr_runs[[1]]$chimeras)
+
+# Get the sequences and cigar labels
+plot_seqs <- mcols(alns)$seq
+cig_labels <- cset$crispr_runs[[1]]$cigar_labels
+names(plot_seqs) <- cig_labels
+
+# Get consensus sequences
+temp <- split(plot_seqs, factor(cig_labels))
+temp_cigs <- split(cigar(alns), factor(cig_labels))
+temp_cigs <- sapply(temp_cigs, unique)
+temp <- DNAStringSet(unlist(sapply(temp, consensusString)))
+starts <- sapply(split(start(alns), factor(cig_labels)), unique)
+
+# The (hidden) CrispRVariants function seqsToAln trims a set of
+# Biostrings::DNAString objects with corresponding cigar strings
+# and introduces gaps where appropriate.  This differs from
+# GenomicAlignments::sequenceLayer in that gaps wider than the target
+# region are trimmed.
+plot_seqs <- CrispRVariants:::seqsToAln(temp_cigs[names(plot_seqs)],
+                      plot_seqs, guide, aln_start = starts[names(plot_seqs)])
+
+# Add in an extra row for showing the sequences that were filtered out
+plot_seqs <- plot_seqs[rownames(variantCounts(cset))]
+plot_seqs["Excluded"] <- paste0(rep(" ",nchar(plot_seqs[[1]])), collapse = "")
+
+# Get the insertion site locations
+ins <- cset$insertion_sites
+
+# Manually set the x-tick locations for plotAlignments
+genomic_coords <- c(start(cset$target):end(cset$target))
+target_coords <- cset$genome_to_target[as.character(genomic_coords)]
+xbreaks = which(target_coords %% 5 == 0 | abs(target_coords) == 1)
+target_coords <- target_coords[xbreaks]
+
+# Make the alignment plot
+p <- plotAlignments(reference, alns = plot_seqs, ins.sites = ins, target.loc = 22,      
+    legend.cols = 4, xtick.labs = target_coords, xtick.breaks = xbreaks)
+p <- p + theme(plot.margin = grid::unit(c(0.1,0,0.5,0.2), "lines"))
+```
+
+We now create a customised heatmap with alleles matching the alignment plot.
+
+```{r}
+
+# Categories reads by the type of mutation they contain
+heatmap_nms <- c("Off-target","Indel within guide","Indel overlaps guide",
+                "Indel outside guide", "SNV near cut", "SNV outside guide",
+                "Large deletion", "Maps to negative strand")
+
+name_to_category <- c("cntnap2b_offtarget1" = "Off-target",
+    "cntnap2b_offtarget_9" = "Off-target",
+    "cntnap2b_offtarget_10" = "Off-target",
+    "cntnap2b_offtarget2" = "Off-target",
+    "cntnap2b_offtarget3" = "Off-target",
+    "cntnap2b_offtarget6" = "Off-target",
+    "cntnap2b_offtarget4" = "Off-target",
+    "cntnap2b_offtarget5" = "Off-target",
+    "cntnap2b_offtarget_7" = "Off-target",
+    "cntnap2b_offtarget_8" = "Off-target",
+    "cntnap2b_amplicon_w_snps" = "SNV outside guide",
+    "cntnap2b_3bp_del_pos1" = "Indel within guide",
+    "cntnap2b_3bp_del_pos-2" = "Indel within guide",
+    "cntnap2b_2bp_del_outside_guide" = "Indel outside guide",
+    "cntnap2b_2bp_del_in_guide_away_from_cut" = "Indel within guide",
+    "cntnap2b_mismatch_pos_1" = "SNV near cut",
+    "cntnap2b_mismatch_pos2_of_PAM" = "SNV near cut",
+    "cntnap2b_guide_in_centre_of_large_deletion" = "Large deletion",
+    "cntnap2b_large_deletion_at_cut" = "Large deletion",
+    "cntnap2b_large_deletion_upstream" = "Large deletion",
+    "cntnap2b_7bp_deletion_pos1" = "Indel within guide",
+    "cntnap2b_mismatches_outside_guide" = "SNV outside guide",
+    "cntnap2b_very_large_deletion" = "Large deletion",
+    "cntnap2b_3bp_insertion_pos1" = "Indel within guide",
+    "cntnap2b_3bp_insertion_pos-2" = "Indel within guide",
+    "cntnap2b_10bp_insertion_pos-2_1" = "Indel within guide",
+    "cntnap2b_10bp_insertion_pos-2_2" = "Indel within guide",
+    "cntnap2b_20bp_ins_pos-1" = "Indel within guide",
+    "cntnap2b_1_bp_del_offtarget_2_bp_del_in_guide",
+    "cntnap2b_amplicon_rc" = "Maps to negative strand",
+    "cntnap2b_1_bp_del_offtarget_2_bp_del_in_guide" = "Indel overlaps guide")                        
+
+# Plot seqs are ordered from top to bottom in alignment plot
+pt_nms <- rev(names(plot_seqs))
+aln_nms <- names(alns)
+
+results <- lapply(seq_along(pt_nms), function(i){
+  # For every row in the plot
+  # classify alignments belonging to that row
+  cig <- pt_nms[[i]]
+  if (cig == "Excluded"){
+    cats <- name_to_category[setdiff(names(name_to_category), aln_nms)]
+  } else {
+    # Which read names match this cigar label
+    a_nms <- aln_nms[cig_labels == cig]
+    # Get classification for these reads
+    cats <- name_to_category[a_nms]
+  }
+  result <- data.frame(table(cats))
+  result$y <- i
+  result
+})
+
+
+results <- do.call(rbind, results)
+# Add space to align to alignment plot
+results$cats <- as.factor(results$cats)
+results$y <- factor(results$y, levels = c(1:(max(results$y) + 1)))
+
+# This colour palette is a smaller version of the palette used by CrispRVariants
+hmcols<-colorRampPalette(c("gold","orange","orangered","red", "darkred"))(10)
+
+q <- ggplot(results, aes(x= cats, y = y)) + geom_tile(aes(fill = Freq)) +
+     theme_bw() + xlab(NULL) +  ylab(NULL) +
+     scale_y_discrete(drop=FALSE) +
+     scale_fill_gradientn(colours = hmcols, na.value = "white",
+                          guide = "legend", breaks = c(1,2,3,4,5,10)) +
+     theme(axis.text.y = element_blank(),
+           axis.ticks.y = element_blank(),
+           axis.text.x = element_text(angle = 45, hjust = 1, size = 5),
+           plot.background=element_rect(fill = "transparent", colour = NA),
+           plot.margin = grid::unit(c(1, 0.25, 0.5, 0), "lines"))
+
+# Arrange the two plots together, so that the y-axes are equal
+p2 <- ggplot2::ggplotGrob(p)
+p3 <- ggplot2::ggplotGrob(q)
+p3$heights <- p2$heights
+
+x <- gridExtra::grid.arrange(gridExtra::arrangeGrob(p2, p3, ncol = 2, widths = c(5,2)), 
+       newpage = FALSE)
+```
+
