@@ -1,6 +1,0 @@
-Annotation
-
-shah_guides.bed - the locations of the guides in the danRer7/Zv9 genome.
-shah_primers.bed - the range spanned by the PCR primers, i.e. the amplicon ranges
-shah_fwd_primers.txt - the guide names and corresponding forward primer sequences 
-
