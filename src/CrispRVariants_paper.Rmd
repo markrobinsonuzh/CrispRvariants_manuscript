@@ -41,10 +41,13 @@ these are stored in the *src* directory.
 The python scripts for primer splitting require the python libraries
 *argparse*, *regex*, *gzip*, *os* and *sys*.
 
+The following R packages are used: *CrispRVariants*,
+*BiocParallel*, *Biostrings*, *BSgenome.Drerio.UCSC.danRer7*,
+*BSgenome.Hsapiens.UCSC.hg19*, *gdata*, *GenomicAlignments*,
+*GenomicFeatures*, *GenomicRanges*,*ggplot2*, *grid*, *gridExtra*
+*reshape2*, *Rsamtools*, *rtracklayer*, *seqinr*, *scales*, *ShortRead*.
 
-%%%%%
- r libraries
-%%%%
+Versions are listed in the ```sessionInfo()``` at the end of this document.
 
 # Directory structure
 
@@ -108,9 +111,9 @@ bdir <- "../Burger_Sanger_data/wtx_ccA/bam"
 bams <- paste0(gsub("[\ |\\/]", "_", md$directory), "_s.bam")
 bam_fnames <- file.path(bdir, bams)
 ref <- getSeq(danRer7, gdl)
-if (as.character(strand(gdl)) == "-"){
-    ref <- reverseComplement(ref)
-}
+#if (as.character(strand(gdl)) == "-"){
+#    ref <- reverseComplement(ref)
+#}
 # After manual inspection, we considered the alignment of "AB1060"
 # to be poor and so remove this sequence.
 cset <- readsToTarget(bam_fnames, gdl, reference = ref, target.loc = 22,
@@ -184,7 +187,7 @@ samtools index ../bam/original.bam
 
 ### Merging reads with PEAR and SEQ PREP
 
-The read names are in the format "@readName length=251".  The read lengths
+The read names are in the format "readName length=251".  The read lengths
 were first stripped from the read names, as these are not always
 identical between the pairs and cause SeqPrep to crash.
 
@@ -660,8 +663,8 @@ dotplot <- function(seq1, seq2=seq1, min.length = 3,
     theme_bw() + xlab(NULL) + ylab(NULL) +
     
     # Set one axis tick line per nucleotide
-    scale_x_discrete(breaks = seq_along(sq1_chr)) +
-    scale_y_discrete(breaks = seq_along(sq2_chr)) +
+    scale_x_continuous(breaks = seq_along(sq1_chr)) +
+    scale_y_continuous(breaks = seq_along(sq2_chr)) +
     
     # Colour the axis ticks according to the nucleotide
     theme(axis.ticks.x = element_line(colour = colours[sq1_chr], size = 1),
@@ -672,8 +675,8 @@ dotplot <- function(seq1, seq2=seq1, min.length = 3,
         panel.grid.major = element_blank()) +
     
     # Zoom the plot to just the seq, without changing data
-    coord_cartesian(xlim = c(0, length(sq1_chr) + 1),
-                    ylim = c(0, length(sq2_chr) + 1))
+    coord_cartesian(xlim = c(-0.5, length(sq1_chr) + 1),
+                    ylim = c(-0.5, length(sq2_chr) + 1), expand = FALSE)
   
   if (! is.null(plot.title)){
     p <- p + annotate("text", label = plot.title, 
@@ -1452,8 +1455,8 @@ This analysis is based on the merged-split-pear preprocessing pipeline.  We can 
 
 # One heterozygous 2bp deletion was detected by looking at the allele 
 # summary plots.  Plot the alleles for this guide (gjd1a_off01)
-f <- csets[["gjd1a_off01"]]
-plotVariants(cset, plotAlignments.args = list(min.freq = 1),
+gjd1a_off01 <- csets[["gjd1a_off01"]]
+plotVariants(gjd1a_off01, plotAlignments.args = list(min.freq = 1),
               plotFreqHeatmap.args = list(min.freq = 1, x.angle = 55))
 
 # Identify SNVs with frequency at least 0.2
@@ -1789,3 +1792,6 @@ x <- gridExtra::grid.arrange(gridExtra::arrangeGrob(p2, p3, ncol = 2, widths = c
        newpage = FALSE)
 ```
 
+```{r}
+sessionInfo()
+```
