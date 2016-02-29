@@ -1,6 +1,6 @@
 library("GenomicRanges")
 library("Biostrings")
-
+library("rtracklayer")
 
 deleteNucleotides <- function(original, original_range, start, width){
     y <- IRanges(start, width = width)
@@ -33,7 +33,7 @@ mutateNucleotides <- function(original, fraction){
 set.seed(30)
 
 
-freqs <- read.table("~/mutation_weights.txt", sep = "\t")
+freqs <- read.table("../Shah_mutation_weights.txt", sep = "\t")
 # Set a low value for large indels
 freqs$x[freqs$Variant > 10] <- 1e-10
 freqs$x <- freqs$x/sum(freqs$x) 
@@ -42,20 +42,27 @@ amplicons <- read.table("../annotation/Shah_cut_sites.txt", sep = "\t",
                 stringsAsFactors = FALSE)
 colnames(amplicons) <- c("name","original","target_loc")
 amplicons[,"target_loc"] <- as.integer(amplicons[,"target_loc"])
-
-# Remove amplicons where the cut site is too close to the read length (for 150bp)
-# For read length 200, one read will still cover target
-#keep <- ! (amplicons$target_loc >= 140 & amplicons$target_loc <= 160)
-#amplicons <- amplicons[keep,]
 amplicons <- amplicons[1:20,]
+
+# Get guides for ampliconDIVider
+guides <- rtracklayer::import("../annotation/shah_guides.bed")
+guides <- guides[match(amplicons$name, guides$name)]
+guides <- guides + 5
+adiv_out <- "../simulation/amplicondivider_commands.sh"
+cat('cd ~/ampliconDIVider-master\nsource ampliconDIV_minimal.sh\n',
+    file = adiv_out)
+
 
 sample_seqs <- function(n_mut, n_original, n_offtarget, amplicons,
                         out_dir, sim_file, mut_frac = 0.3, 
                         log_file = NA, nvars = 10, crispresso_file =  NA,
                         read_len = 200){
                        
-  dummy <- apply(amplicons, 1, function(a_rw){
-    original <- DNAString(a_rw["original"])
+  dummy <- lapply(1:nrow(amplicons), function(i){
+    a_rw <- amplicons[i, ]
+    print(class(a_rw))
+    original <- DNAString(a_rw$original)
+    print("original")
     target_loc <- as.integer(a_rw["target_loc"])
     gd_name <- a_rw["name"]    
     guide <- substr(original, target_loc-17, target_loc + 5)
@@ -83,7 +90,6 @@ sample_seqs <- function(n_mut, n_original, n_offtarget, amplicons,
 
     out_fname <- file.path(out_dir, sprintf("%s_%smut_%swt_%sofftarget_%sreadlen.fa", 
                   gd_name, n_mut, n_original, n_offtarget, read_len))
-    out <- file(out_fname)
 
     result <- c(new_seqs, mut_seqs, replicate(n_original, original))
     result_names <- c(rep(">var", n_mut), 
@@ -101,28 +107,38 @@ sample_seqs <- function(n_mut, n_original, n_offtarget, amplicons,
     new_seqs <- paste(result_names, sapply(result, as.character), sep = "\n")
     new_seqs <- paste0(new_seqs, collapse = "\n")
     
-    write(new_seqs, out)
-    close(out)
-    
     # art_illumina command with seed = 30
     sim_template <- "art_illumina -amp -rs 30 -f 10 -l %s -p -ss MS -na -i %s -o %s\n"
     cat(sprintf(sim_template, read_len, out_fname, gsub(".fa", "_sim", out_fname)), 
         file = sim_file, append = TRUE)
 
+    # Commands for CRISPResso
     f1 <- gsub(".fa", "_sim1.fq", out_fname)
     f2 <- gsub(".fa", "_sim2.fq", out_fname)
     crispresso_dir <- "crispresso"
     crispresso_template <- "CRISPResso -r1 %s -r2 %s -a %s -g %s -o %s -w 5\n"
     cat(sprintf(crispresso_template, f1,f2, original, guide, crispresso_dir),
         file = crispresso_file, append = TRUE)
-    
+        
+    # Commands for ampliconDIVider
+    adiv_dir <- "../simulation/amplicondivider"
+    adiv_tmp1 <- 'samtools view -hb %s %s > temp.bam'
+    adiv_tmp2 <- 'parseBam temp.bam %s %s %s; rm temp.bam'
+    adiv_tmp3 <- 'mv frameshift_summary_%s %s\n\n' 
+    bam <- gsub(".fa", "_merged.bam", out_fname)
+    gd <- guides[i]
+    gd_rng <- sprintf("%s:%s-%s", seqnames(gd), start(gd)-200, end(gd)+200)
+    base <- gsub(".fa", "", basename(out_fname))
+    a1 <- sprintf(adiv_tmp1, bam, gd_rng) 
+    a2 <- sprintf(adiv_tmp2, base, start(gd) - 5, end(gd) + 5)
+    a3 <- sprintf(adiv_tmp3, base, file.path(adiv_dir, paste0(base, ".txt")))
+    cat(paste(a1,a2,a3, sep = "\n"), file = adiv_out, append = TRUE)
   })
 }
 
-sim_cmds <- "~/scratch/simulation_commands.sh"
-crispresso_cmds <- "~/scratch/crispresso_commands.sh"
+sim_cmds <- "../simulation/simulation_commands.sh"
+crispresso_cmds <- "../simulation/crispresso_commands.sh"
 
-#for (read_len in c(150, 200))
 for (nofftargets in c(100,33,0)){
     # 0% efficient  
     sample_seqs(0,300, nofftargets, amplicons, "~/scratch", 
@@ -142,36 +158,8 @@ for (nofftargets in c(100,33,0)){
 }
 
     
-
-
-
-
-# cnsta
-#original <- DNAString("CATGCACTGCTCTCAGAAAGCCTGAAGCACAATTACTGCTGAACTATGAGTCAGTTCAGTTAAAGGCCGGCTATTTCTTTACTGTTCCTGATTATTCTGTGTCTCCCAGAGGCAGAGCGGAGCGGCGTCCAGTGCCTGAGCGGATCTTGATGGATGACGGTCAGTGGCAGAGCGACGGCCCTGTAAGGAGAGGAGGAGCGACTGAGCCGGAGCTACAGAGCTGCTCTGAGTCCTTCCGCAGCCCTGATGACAACCACAACCGGCTGCT")
-#original_range <- IRanges(1, length(original))
-#target_loc <- 185 
-
-#out <- file("~/Desktop/out_seqs.fa")
-
-# generate - as for Sup 1, without min.freq = 2
-# dat <- dat[,c(1:3)]
-# x <- aggregate(dat$Frequency, dat[c(1,2)], mean)
-# x$var_type  <- gsub("[0-9]", "", x$Variant)
-# x$Variant <- gsub("I|D", "", x$Variant)
-# write.table(x, file = "~/mutation_weights.txt", sep = "\t", quote = FALSE)
-
-
-# amplicon sequencing simulation with paired-end reads
-#  art_illumina -amp -f 100 -l 198 -p -ss MS -na -i amp_reference.fa -o amplicon_simulation
-
-
-
-#bam <- "amplicon_simulation_bwa_s.bam"
-#guides <- rtracklayer::import("~/crispRvariants_supplementary/annotation/guides.bed")
-#guide <- guides[guides$name == "cnsta"]
-#library(BSgenome.Drerio.UCSC.danRer7) 
-#danRer7 <- BSgenome.Drerio.UCSC.danRer7
-#guide <- guide + 5
-#reference <- getSeq(danRer7, guide)
-#library(CrispRVariants)
-#cset <- readsToTarget(bam, target = guide, reference= reference, target.loc = 22, split.snv = FALSE)
+# Write amplicons and guides into file for CRISPRessoPooled 
+original <- amplicons$original
+guide <- substr(original, amplicons$target_loc-17, amplicons$target_loc + 5)
+amplicon_inf <- paste(amplicons$name, original, guide, sep = "\t", collapse = "\n")
+cat(amplicon_inf, file = "../simulation/merged/crispresso_pooled_amplicons.txt")
