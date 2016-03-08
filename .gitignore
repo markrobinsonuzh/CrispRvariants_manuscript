@@ -1,4 +1,6 @@
 .DS_Store
+ampliconDIVider-master
+simulation
 src/psl2sam.pl
 src/CrispRVariants_paper_cache
 src/CrispRVariants_paper_files
@@ -9,4 +11,4 @@ split_merged
 fastq
 idx
 bam
-
+results/test

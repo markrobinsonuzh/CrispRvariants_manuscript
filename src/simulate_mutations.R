@@ -33,7 +33,7 @@ mutateNucleotides <- function(original, fraction){
 set.seed(30)
 
 
-freqs <- read.table("../Shah_mutation_weights.txt", sep = "\t")
+freqs <- read.table("../annotation/Shah_mutation_weights.txt", sep = "\t")
 # Set a low value for large indels
 freqs$x[freqs$Variant > 10] <- 1e-10
 freqs$x <- freqs$x/sum(freqs$x) 
@@ -48,8 +48,8 @@ amplicons <- amplicons[1:20,]
 guides <- rtracklayer::import("../annotation/shah_guides.bed")
 guides <- guides[match(amplicons$name, guides$name)]
 guides <- guides + 5
-adiv_out <- "../simulation/amplicondivider_commands.sh"
-cat('cd ~/ampliconDIVider-master\nsource ampliconDIV_minimal.sh\n',
+adiv_out <- "amplicondivider_simulation_commands.sh"
+cat('cd ../ampliconDIVider-master\nsource ampliconDIV_minimal.sh\n',
     file = adiv_out)
 
 
@@ -60,13 +60,10 @@ sample_seqs <- function(n_mut, n_original, n_offtarget, amplicons,
                        
   dummy <- lapply(1:nrow(amplicons), function(i){
     a_rw <- amplicons[i, ]
-    print(class(a_rw))
     original <- DNAString(a_rw$original)
-    print("original")
     target_loc <- as.integer(a_rw["target_loc"])
     gd_name <- a_rw["name"]    
     guide <- substr(original, target_loc-17, target_loc + 5)
-    print(unname(c(gd_name, as.character(guide))))
     original_range <- IRanges(1, length(original))
     amp_loc <- target_loc + freqs$Location - 1
     subsamp <- sample(1:nrow(freqs), nvars, prob = freqs$x)
@@ -106,6 +103,8 @@ sample_seqs <- function(n_mut, n_original, n_offtarget, amplicons,
 
     new_seqs <- paste(result_names, sapply(result, as.character), sep = "\n")
     new_seqs <- paste0(new_seqs, collapse = "\n")
+    print(sprintf("Writing sequences to: %s", out_fname))
+    cat(new_seqs, file = out_fname)
     
     # art_illumina command with seed = 30
     sim_template <- "art_illumina -amp -rs 30 -f 10 -l %s -p -ss MS -na -i %s -o %s\n"
@@ -136,24 +135,24 @@ sample_seqs <- function(n_mut, n_original, n_offtarget, amplicons,
   })
 }
 
-sim_cmds <- "../simulation/simulation_commands.sh"
-crispresso_cmds <- "../simulation/crispresso_commands.sh"
+sim_cmds <- "simulation_commands.sh"
+crispresso_cmds <- "crispresso_simulation_commands.sh"
 
 for (nofftargets in c(100,33,0)){
     # 0% efficient  
-    sample_seqs(0,300, nofftargets, amplicons, "~/scratch", 
+    sample_seqs(0,300, nofftargets, amplicons, "../simulation", 
                sim_file = sim_cmds, crispresso_file = crispresso_cmds)
     
     # 33% efficient
-    sample_seqs(100,200, nofftargets, amplicons, "~/scratch", 
+    sample_seqs(100,200, nofftargets, amplicons, "../simulation", 
                sim_file = sim_cmds, crispresso_file = crispresso_cmds)
     
     # 66% efficient
-    sample_seqs(200,100, nofftargets, amplicons, "~/scratch", 
+    sample_seqs(200,100, nofftargets, amplicons, "../simulation", 
                sim_file = sim_cmds, crispresso_file = crispresso_cmds)
                
     # 90% efficient
-    sample_seqs(270,30, nofftargets, amplicons, "~/scratch", 
+    sample_seqs(270,30, nofftargets, amplicons, "../simulation", 
                sim_file = sim_cmds, crispresso_file = crispresso_cmds)
 }
 
