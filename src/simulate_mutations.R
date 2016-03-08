@@ -162,3 +162,9 @@ original <- amplicons$original
 guide <- substr(original, amplicons$target_loc-17, amplicons$target_loc + 5)
 amplicon_inf <- paste(amplicons$name, original, guide, sep = "\t", collapse = "\n")
 cat(amplicon_inf, file = "../simulation/merged/crispresso_pooled_amplicons.txt")
+
+
+
+
+cat("\n\nmv crispresso/* ../simulation/crispresso; rmdir crispresso\n", 
+    file = crispresso_cmds, append = TRUE)
