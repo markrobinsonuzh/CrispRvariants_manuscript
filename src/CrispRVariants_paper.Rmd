@@ -1556,8 +1556,11 @@ The MiSeq data is available from [ArrayExpress](https://www.ebi.ac.uk/arrayexpre
 
 # Creating the txdb
 
-CREATING THE TXDB
+The transcript database was created using the ```GenomicFeatures::makeTxDbFromUCSC```
+function, with Ensembl gene annotation.
 
+
+#######
 
 
 # Supplementary Note 4: Synthetic datasets for benchmarking CRISPR sequencing analysis tools
@@ -1829,7 +1832,7 @@ by running ```crispresso_pooled_simulation_commands.R``` and run by sourcing the
 
 For *CrispRVariants*, reads were mapped using *bwa mem* by running the ```map_simulated.sh``` script.  Variant quantification with *CrispRVaraints* is detailed below.
 
-```{r}
+```{r, fig.height = 8}
 library(BSgenome.Drerio.UCSC.danRer7)
 library(CrispRVariants)
 library(ggplot2)
@@ -1907,12 +1910,12 @@ crispresso_dirs <- list.files("../simulation/crispresso", full.names = TRUE)
 identical(unname(sapply(base, function(bb) grep(bb, crispresso_dirs))),c(1:length(base)))
 
 result <- lapply(seq_along(base), function(i){
-            print(i)
             sim_guide <- sim_guides[i]
             guide <- guides[guides$name == sim_guide]
             reference <- references[guides$name == sim_guide][[1]]
             cset <- readsToTarget(bams[i], target.loc = 22, 
-                target = guide, reference = reference, collapse.pairs = TRUE)
+                target = guide, reference = reference, collapse.pairs = TRUE,
+                verbose = FALSE)
             crispresso <- parseCRISPResso(crispresso_dirs[i])
             c(sim_guide, noff[i], truth[i], 
               mutationEfficiency(cset)[["Average"]], crispresso[[1]])    
@@ -2120,7 +2123,7 @@ The Burger *et al* MiSeq data is available from ArrayExpress with accession numb
 Here we assume that the bam files have been download into a directory named "Burger_MiSeq_data".
 These are paired-end 250bp reads.
 
-```{r, message = FALSE}
+```{r, message = FALSE, warning = FALSE}
 bam_dir <- "../Burger_MiSeq_data"
 bams <- list.files(bam_dir, pattern = "*.bam$", full.names = TRUE)
 target <- rtracklayer::import("../annotation/Burger_MiSeq_guides.bed")
@@ -2324,7 +2327,7 @@ getChByTgt <- function(bams, guides, target_ranges){
 
 ## Chimera analysis with Cho data
 
-```{r}
+```{r, warning = FALSE}
 library("BiocParallel")
 library("BSgenome.Hsapiens.UCSC.hg19")
 library("CrispRVariants")
@@ -2449,3 +2452,4 @@ gridExtra::grid.arrange(p1,p2, ncol=2)
 ```{r}
 sessionInfo()
 ```
+ 
