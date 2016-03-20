@@ -28,7 +28,7 @@ library(BSgenome.Drerio.UCSC.danRer7)
 danRer7 <- BSgenome.Drerio.UCSC.danRer7
 
 primers <- import("../annotation/shah_primers.bed")
-start(primers) <- start(primers) + 1 # COMPENSATE FOR ADDITION OF 1 TO START
+start(primers) <- start(primers) + 1
 sqs <- as.character(getSeq(danRer7, primers))
 names(sqs) <- primers$name
 
